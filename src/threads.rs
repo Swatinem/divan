@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::slice::IterMut;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -11,15 +12,15 @@ pub(crate) struct AuxiliaryThreads {
 }
 
 impl AuxiliaryThreads {
-    pub fn with_threads<ThreadFn, Scope, R>(
-        &self,
+    pub fn with_threads<'env, ThreadFn, Scope, R>(
+        &'env self,
         thread_count: usize,
         task_fn: ThreadFn,
         scope: Scope,
     ) -> R
     where
         ThreadFn: Fn() -> RawSample,
-        Scope: FnOnce(Results) -> R,
+        Scope: for<'scope> FnOnce(&'scope mut Results<'scope, 'env>) -> R,
     {
         let mut threads = self.inner.borrow_mut();
         if threads.len() < thread_count {
@@ -27,36 +28,42 @@ impl AuxiliaryThreads {
         }
         let threads = &mut threads[..thread_count];
 
-        // SAFETY: We wait for all child task to finish executing their copy of the
-        // `task_fn` within `Results::drop`. Therefore we are not holding on to the `task_fn`
-        // after returning from this function / scope.
+        // SAFETY: We wait for all child task to finish executing their copy of the `task_fn`
+        // before leaving this scope by exhausting the `Results` iterator and thus
+        // waiting for all the results.
+        // Therefore we are not holding on to the `task_fn` after returning
+        // from this function / scope.
         let dyn_task_fn: &dyn Fn() -> RawSample = &task_fn;
         let dyn_task_fn: Task = unsafe { std::mem::transmute(dyn_task_fn) };
 
         for thread in threads.iter() {
             thread.send_workload.as_ref().unwrap().send(dyn_task_fn).unwrap();
         }
+        let mut results =
+            Results { threads: threads.iter_mut(), env: PhantomData, scope: PhantomData };
 
-        scope(Results { threads: threads.iter_mut() })
+        let res = scope(&mut results);
+
+        // wait for the rest of the results that weren’t yet awaited within the `scope`.
+        for _result in results {}
+
+        res
     }
 }
 
-pub(crate) struct Results<'t> {
-    threads: IterMut<'t, BencherThread>,
+pub(crate) struct Results<'scope, 'env> {
+    threads: IterMut<'scope, BencherThread>,
+
+    scope: PhantomData<&'scope mut &'scope ()>,
+    env: PhantomData<&'env mut &'env ()>,
 }
 
-impl Iterator for Results<'_> {
+impl Iterator for Results<'_, '_> {
     type Item = RawSample;
 
     fn next(&mut self) -> Option<Self::Item> {
         let thread = self.threads.next()?;
         Some(thread.expect_result())
-    }
-}
-
-impl Drop for Results<'_> {
-    fn drop(&mut self) {
-        for _result in self {}
     }
 }
 
